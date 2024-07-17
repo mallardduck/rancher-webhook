@@ -134,6 +134,14 @@ func (m *ProvisioningClusterMutator) Admit(request *admission.Request) (*admissi
 		return response, nil
 	}
 
+	response, err = m.handleRegistryAuthConfigSecret(request, cluster)
+	if err != nil {
+		return nil, err
+	}
+	if response.Result != nil {
+		return response, nil
+	}
+
 	if request.Operation == admissionv1.Update {
 		response = m.handleDynamicSchemaDrop(request, oldCluster, cluster)
 		if response.Result != nil {
@@ -286,6 +294,47 @@ func (m *ProvisioningClusterMutator) ensureSecret(namespace, name string, data m
 		return err
 	}
 	return nil
+}
+
+func (m *ProvisioningClusterMutator) handleRegistryAuthConfigSecret(request *admission.Request, cluster *v1.Cluster) (*admissionv1.AdmissionResponse, error) {
+	if cluster.Name == "local" || cluster.Spec.RKEConfig == nil {
+		return admission.ResponseAllowed(), nil
+	}
+
+	switch request.Operation {
+	case admissionv1.Create, admissionv1.Update:
+		if cluster.DeletionTimestamp != nil {
+			return admission.ResponseAllowed(), nil
+		}
+
+		registrySecretNames := make([]string, 0)
+		for _, config := range cluster.Spec.RKEConfig.Registries.Configs {
+			if !strings.HasSuffix(config.AuthConfigSecretName, "registryconfig-auth-") {
+				registrySecretNames = append(registrySecretNames, config.AuthConfigSecretName)
+			}
+		}
+
+		for _, registrySecretName := range registrySecretNames {
+			secret, err := m.secret.Get(cluster.Namespace, registrySecretName, metav1.GetOptions{})
+			if err == nil && !secretHasFleetLabel(secret) {
+				labels := secret.GetLabels()
+				labels["fleet.cattle.io/managed"] = "true"
+				secret.SetLabels(labels)
+				_, err = m.secret.Update(secret)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	return admission.ResponseAllowed(), nil
+}
+
+func secretHasFleetLabel(secret *corev1.Secret) bool {
+	labels := secret.GetLabels()
+	// check if labels has "fleet.cattle.io/managed" key
+	val, ok := labels["fleet.cattle.io/managed"]
+	return ok && val == "true"
 }
 
 // getKubeAPIServerArg returns a map representation of the value of kube-apiserver-arg from the cluster's MachineGlobalConfig.
